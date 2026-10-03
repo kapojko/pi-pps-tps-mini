@@ -20,6 +20,18 @@
  * Everything is exact (provider usage + measured spans), no live estimates,
  * no calibration, no commands. The display updates when each assistant
  * message completes; between messages the last final line stays visible.
+ *
+ * Color: everything renders in the footer's default color (plain text, no
+ * color escapes). The only exception is stale pps — the previous value kept
+ * when the current prompt was too short to measure — rendered ~45% darker.
+ *
+ * Prompt tokens and the cache: pi normalizes provider usage so `usage.input`
+ * EXCLUDES cache-read and cache-write tokens (Anthropic reports them
+ * separately; for OpenAI-compatible APIs cached_tokens is subtracted from
+ * prompt_tokens). pps therefore measures the speed of prefilling the NEW,
+ * uncached part of the prompt — cache-heavy turns naturally have small
+ * uncached remainders and fall under MIN_PROMPT_TOKENS, keeping the last
+ * good value on screen instead of a meaningless spike.
  */
 import type { ExtensionAPI, ThemeColor } from "@earendil-works/pi-coding-agent";
 
@@ -28,26 +40,13 @@ const STATUS_KEY = "pps-tps";
 const ICON = "⚡";
 const MIN_PROMPT_TOKENS = 1000; // below this, TTFT ≈ latency → skip pps update
 
-// ── Palette (from pi-speedline) ─────────────────────────────────────────
-// gold = pps, jade = tgs (bold), ghost variants (55%) for dimmed/absent.
-type Field = "gold" | "jade" | "coral";
-
-const DARK_PAL: Record<Field, [number, number, number]> = {
-	gold: [227, 186, 110],
-	jade: [78, 199, 166],
-	coral: [217, 126, 85],
-};
-const LIGHT_PAL: Record<Field, [number, number, number]> = {
-	gold: [166, 120, 42],
-	jade: [23, 132, 104],
-	coral: [176, 82, 36],
-};
+// ── Paint ───────────────────────────────────────────────────────────────
+// Plain text everywhere → the footer's default (grey) color. Ghost (stale
+// pps, placeholders) = the theme's resolved "text" foreground scaled down
+// by GHOST; if that color can't be parsed, ANSI "faint" as a fallback.
 const GHOST = 0.55;
 
-let paintCache: {
-	key: string;
-	paint: (f: Field, t: string, opts?: { ghost?: boolean; bold?: boolean }) => string;
-} | null = null;
+let paintCache: { key: string; paint: (t: string, ghost?: boolean) => string } | null = null;
 
 function rgb256ToRgb(n: number): [number, number, number] {
 	if (n < 16) {
@@ -96,25 +95,17 @@ function getPaint(theme: SpeedCtx["ui"]["theme"]) {
 	const key = `${ansi}|${mode}`;
 	if (paintCache?.key === key) return paintCache.paint;
 	const textRgb = parseFgAnsi(ansi);
-	// Bright text color ⇒ dark terminal background ⇒ dark palette (and vice versa).
-	const lum = textRgb
-		? (0.2126 * textRgb[0] + 0.7152 * textRgb[1] + 0.0722 * textRgb[2]) / 255
-		: 0;
-	const pal = lum > 0.5 ? DARK_PAL : LIGHT_PAL;
 	const to256 = mode !== "truecolor";
-	const codeCache: Record<string, string> = {};
-	const codeFor = (rgb: [number, number, number]) => {
-		const k = rgb.join(",");
-		if (!codeCache[k]) codeCache[k] = to256 ? `38;5;${nearest256(rgb)}` : `38;2;${rgb.join(";")}`;
-		return codeCache[k]!;
-	};
-	const paint: (f: Field, t: string, opts?: { ghost?: boolean; bold?: boolean }) => string = (f, t, opts) => {
-		const rgb = pal[f]!;
-		const out: [number, number, number] = opts?.ghost
-			? [Math.round(rgb[0] * GHOST), Math.round(rgb[1] * GHOST), Math.round(rgb[2] * GHOST)]
-			: rgb;
-		const bold = opts?.bold ? "\x1b[1m" : "";
-		return `${bold}\x1b[${codeFor(out)}m${t}\x1b[0m${bold ? "\x1b[22m" : ""}`;
+	const paint: (t: string, ghost?: boolean) => string = (t, ghost) => {
+		if (!ghost) return t; // plain → footer default color
+		if (!textRgb) return `\x1b[2m${t}\x1b[0m`; // faint fallback
+		const out: [number, number, number] = [
+			Math.round(textRgb[0] * GHOST),
+			Math.round(textRgb[1] * GHOST),
+			Math.round(textRgb[2] * GHOST),
+		];
+		const code = to256 ? `38;5;${nearest256(out)}` : `38;2;${out.join(";")}`;
+		return `\x1b[${code}m${t}\x1b[0m`;
 	};
 	paintCache = { key, paint };
 	return paint;
@@ -173,18 +164,11 @@ function resetAll() {
 }
 
 // ── Rendering (all UI writes happen inside event handlers — never a timer) ──
-function iconOf(ctx: SpeedCtx): string {
-	return ctx.ui.theme.fg("accent", ICON);
-}
-
 /** Skeleton for states without any data (fresh session). */
 function renderSkeleton(ctx: SpeedCtx) {
 	if (!ctx.hasUI) return;
 	const paint = getPaint(ctx.ui.theme);
-	ctx.ui.setStatus(
-		STATUS_KEY,
-		`${iconOf(ctx)} ${paint("gold", "–pps", { ghost: true })} ${paint("jade", "–tgs", { ghost: true })}`,
-	);
+	ctx.ui.setStatus(STATUS_KEY, `${ICON} ${paint("–pps", true)} ${paint("–tgs", true)}`);
 }
 
 /** Final line after a completed assistant message. */
@@ -193,13 +177,13 @@ function renderFinal(ctx: SpeedCtx) {
 	const paint = getPaint(ctx.ui.theme);
 	const pps =
 		ppsValue !== undefined
-			? paint("gold", `${Math.round(ppsValue)}pps`, { ghost: ppsStale })
-			: paint("gold", "–pps", { ghost: true });
+			? paint(`${Math.round(ppsValue)}pps`, ppsStale)
+			: paint("–pps", true);
 	const tgs =
 		roundStreamSpanMs > 0
-			? paint("jade", `${Math.round(roundOutputTokens / (roundStreamSpanMs / 1000))}tgs`, { bold: true })
-			: paint("jade", "–tgs", { ghost: true });
-	ctx.ui.setStatus(STATUS_KEY, `${iconOf(ctx)} ${pps} ${tgs}`);
+			? paint(`${Math.round(roundOutputTokens / (roundStreamSpanMs / 1000))}tgs`)
+			: paint("–tgs", true);
+	ctx.ui.setStatus(STATUS_KEY, `${ICON} ${pps} ${tgs}`);
 }
 
 // ── Extension ───────────────────────────────────────────────────────────

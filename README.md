@@ -32,8 +32,11 @@ The status slot has three elements:
 - Each LLM call of a round measures its own prefill; the displayed pps is
   the latest one. tgs is accumulated across the whole round (one user
   prompt's agent loop).
-- Theme-adaptive palette (light/dark), with a 256-color fallback; ghost
-  variants at 55% brightness for dimmed/absent values.
+- Theme-neutral, distraction-free: everything renders in the footer's
+  default color (plain text). The only exception is stale pps — the
+  previous value kept after a short prompt — rendered **slightly darker**
+  (~45%, the theme's text color scaled down; ANSI "faint" as fallback),
+  so it reads as "last known value", not current.
 
 ## Install
 
