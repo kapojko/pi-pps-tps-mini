@@ -208,9 +208,14 @@ export default function piPpsTpsMini(pi: ExtensionAPI) {
 	// TTFT anchor: fires right before the HTTP request goes out. (pi's
 	// assistant message_start fires at the FIRST SSE event — ≈ the first
 	// token — so it cannot measure TTFT.) Overwritten per request: every
-	// LLM call of a round gets its own prefill measurement.
+	// LLM call of a round gets its own prefill measurement. The per-message
+	// delta clock is also reset here — without this, msgFirstDeltaAt from
+	// the round's first message leaks into every later message's span,
+	// sweeping tool runs and inter-call gaps into tgs.
 	pi.on("before_provider_request", async () => {
 		reqAnchorAt = Date.now();
+		msgFirstDeltaAt = undefined;
+		msgLastDeltaAt = undefined;
 	});
 
 	pi.on("message_update", async (event) => {
