@@ -18,8 +18,17 @@
  *         inter-call gaps excluded) across the current round.
  *
  * Everything is exact (provider usage + measured spans), no live estimates,
- * no calibration, no commands. The display updates when each assistant
- * message completes; between messages the last final line stays visible.
+ * no calibration. The display updates when each assistant message completes;
+ * between messages the last final line stays visible.
+ *
+ * Session totals (see /pps-tgs): accumulated prefill time, decode time and
+ * round wall time for the current pi runtime, plus aggregate rates computed
+ * as Σtokens ÷ Σtime (single time-weighted number per metric — no mean of
+ * per-call rates, no percentiles). "w/o 1st" drops the runtime's FIRST
+ * assistant request from both the time and the token numerator: it usually
+ * carries server-side model load / cold cache and says little about steady
+ * state. Totals are in-memory only — pi stores no timings in the session
+ * JSONL, so /resume, /fork and /reload start from zero.
  *
  * Color: everything renders in the footer's default color (plain text, no
  * color escapes). The only exception is stale pps — the previous value kept
@@ -136,6 +145,21 @@ let roundStreamSpanMs = 0; // Σ (lastDelta - firstDelta) per message — pure s
 let ppsValue: number | undefined;
 let ppsStale = false;
 
+// Session totals for /pps-tgs (in-memory only; reset on session boundaries).
+// Every accumulator is a Σ over assistant messages of THIS pi runtime.
+let calls = 0; // assistant messages finalized (the "1st" is calls === 1)
+let prefillsMeasured = 0;
+let prefillMs = 0;
+let prefillTokens = 0;
+let prefillMsExclFirst = 0;
+let prefillTokensExclFirst = 0;
+let decodeMs = 0;
+let decodeTokens = 0; // only output tokens of messages with a measured span
+let outputTokens = 0;
+let inputTokens = 0;
+let roundWallMs = 0; // Σ (agent_start → agent_end): LLM calls + tool runs
+let roundStartAt: number | undefined;
+
 // Per-message (current streaming LLM call)
 let reqAnchorAt: number | undefined; // this request's before_provider_request
 let msgFirstDeltaAt: number | undefined;
@@ -155,12 +179,28 @@ function resetRound() {
 	// the previous value.
 }
 
+function resetSessionTotals() {
+	calls = 0;
+	prefillsMeasured = 0;
+	prefillMs = 0;
+	prefillTokens = 0;
+	prefillMsExclFirst = 0;
+	prefillTokensExclFirst = 0;
+	decodeMs = 0;
+	decodeTokens = 0;
+	outputTokens = 0;
+	inputTokens = 0;
+	roundWallMs = 0;
+	roundStartAt = undefined;
+}
+
 function resetAll() {
 	roundOutputTokens = 0;
 	roundStreamSpanMs = 0;
 	ppsValue = undefined;
 	ppsStale = false;
 	resetMessage();
+	resetSessionTotals();
 }
 
 // ── Rendering (all UI writes happen inside event handlers — never a timer) ──
@@ -186,6 +226,59 @@ function renderFinal(ctx: SpeedCtx) {
 	ctx.ui.setStatus(STATUS_KEY, `${ICON} ${pps} ${tgs}`);
 }
 
+// ── Session totals report (/pps-tgs) ───────────────────────────────────
+const pad = (s: string, w: number) => s.padEnd(w);
+const num = (n: number) => n.toLocaleString("en-US");
+/**
+ * Duration, humanized: 0.42s / 2.85s / 10.0s / 59.9s / 1m 08s / 6m 52s /
+ * 1h 02m 03s. Fractional seconds are kept only under a minute — above that
+ * they are noise compared with TTFT measurement jitter.
+ */
+const dur = (ms: number): string => {
+	if (ms < 10_000) return `${(ms / 1000).toFixed(2)}s`;
+	if (ms < 60_000) return `${(ms / 1000).toFixed(1)}s`;
+	const total = Math.round(ms / 1000);
+	const h = Math.floor(total / 3600);
+	const m = Math.floor((total % 3600) / 60);
+	const s = total % 60;
+	if (h > 0) return `${h}h ${String(m).padStart(2, "0")}m ${String(s).padStart(2, "0")}s`;
+	return `${m}m ${String(s).padStart(2, "0")}s`;
+};
+const rate = (tokens: number, ms: number) =>
+	tokens > 0 && ms > 0 ? `${Math.round(tokens / (ms / 1000))} t/s` : "– t/s";
+
+function renderTotals(ctx: { ui: { notify: (message: string, level?: "info" | "warning" | "error") => void } }) {
+	const w = 22;
+	// label, duration, tokens whose rate to show (0 = no rate line)
+	const rows: [string, number, number][] = [
+		["Prefill total:", prefillMs, prefillTokens],
+		["Prefill w/o 1st:", prefillMsExclFirst, prefillTokensExclFirst],
+		["Decode total:", decodeMs, decodeTokens],
+		["Round wall time:", roundWallMs, 0],
+		["Tools + gaps:", Math.max(0, roundWallMs - prefillMs - decodeMs), 0],
+	];
+	// Duration column padded to the widest value → the "→ rate" tails line up
+	// whether the session ran 3 seconds or 3 hours.
+	const tw = Math.max(9, ...rows.map((r) => dur(r[1]).length));
+
+	const lines: string[] = [];
+	lines.push(`${ICON} session speed — this pi runtime (totals are not persisted)`);
+	lines.push("");
+	lines.push(pad("Assistant calls:", w) + `${calls}  (${prefillsMeasured} with measured prefill)`);
+	lines.push(pad("Prompt tokens:", w) + `${num(inputTokens)}  (uncached part only)`);
+	lines.push(pad("Output tokens:", w) + num(outputTokens));
+	lines.push("");
+	for (const [label, ms, tokens] of rows) {
+		const tail = tokens > 0 ? `  →  ${rate(tokens, ms)}` : "";
+		lines.push((pad(label, w) + pad(dur(ms), tw) + tail).trimEnd());
+	}
+	lines.push("");
+	lines.push("Rates are aggregate: Σtokens ÷ Σtime. Cache-heavy turns have a small");
+	lines.push("uncached remainder but pay TTFT for the whole prefix, so the session");
+	lines.push("aggregate sits below the live ⚡ value — normal, not a bug.");
+	ctx.ui.notify(lines.join("\n"), "info");
+}
+
 // ── Extension ───────────────────────────────────────────────────────────
 export default function piPpsTpsMini(pi: ExtensionAPI) {
 	pi.on("session_start", async (_event, ctx) => {
@@ -203,6 +296,17 @@ export default function piPpsTpsMini(pi: ExtensionAPI) {
 	// stays on screen; the next message_end updates it.
 	pi.on("agent_start", async () => {
 		resetRound();
+		if (roundStartAt === undefined) roundStartAt = Date.now();
+	});
+
+	// Wall clock of one low-level run (its LLM calls + tool runs). Paired with
+	// agent_start; if a run is torn down without agent_end the session boundary
+	// resets it anyway.
+	pi.on("agent_end", async () => {
+		if (roundStartAt !== undefined) {
+			roundWallMs += Date.now() - roundStartAt;
+			roundStartAt = undefined;
+		}
 	});
 
 	// TTFT anchor: fires right before the HTTP request goes out. (pi's
@@ -232,21 +336,28 @@ export default function piPpsTpsMini(pi: ExtensionAPI) {
 		const m = event.message;
 		if (m?.role !== "assistant") return;
 
-		// Accumulate this message's pure streaming time (tool runs and
-		// inter-call gaps stay out of tgs).
+		// Pure streaming time of this message (tool runs and inter-call gaps
+		// stay out of it). Degenerate case: a provider that delivers everything
+		// in one chunk produces a single delta → span would be 0, so fall back
+		// to the message_end clock (it also absorbs finalize latency and other
+		// extensions' message_end handlers — only used when deltas give nothing).
+		let spanMs: number | undefined;
 		if (msgFirstDeltaAt !== undefined && msgLastDeltaAt !== undefined) {
-			roundStreamSpanMs += msgLastDeltaAt - msgFirstDeltaAt;
+			spanMs = msgLastDeltaAt - msgFirstDeltaAt;
+			if (spanMs <= 0) spanMs = Math.max(0, Date.now() - msgFirstDeltaAt);
 		}
+		if (spanMs !== undefined) roundStreamSpanMs += spanMs;
 
 		// Prefill: prompt tokens ÷ TTFT of THIS request. Short prompts
 		// (TTFT ≈ network latency) don't update pps — the previous value
 		// stays, rendered dimmed.
-		const ttftMs =
+		const rawTtftMs =
 			reqAnchorAt !== undefined && msgFirstDeltaAt !== undefined
 				? msgFirstDeltaAt - reqAnchorAt
 				: undefined;
+		const ttftMs = rawTtftMs !== undefined && rawTtftMs > 0 ? rawTtftMs : undefined;
 		const input = m.usage?.input ?? 0;
-		if (input > 0 && ttftMs !== undefined && ttftMs > 0) {
+		if (input > 0 && ttftMs !== undefined) {
 			if (input >= MIN_PROMPT_TOKENS) {
 				ppsValue = input / (ttftMs / 1000);
 				ppsStale = false;
@@ -258,6 +369,41 @@ export default function piPpsTpsMini(pi: ExtensionAPI) {
 		const out = m.usage?.output ?? 0;
 		if (out > 0) roundOutputTokens += out;
 
+		// Session accumulators. The first assistant request of this runtime is
+		// skipped for the "w/o 1st" variant even when it is a continuation (a
+		// resumed session has no way to tell cold prefill from warm one).
+		calls++;
+		const isFirstCall = calls === 1;
+		inputTokens += input;
+		outputTokens += out;
+		if (ttftMs !== undefined && input > 0) {
+			prefillsMeasured++;
+			prefillMs += ttftMs;
+			prefillTokens += input;
+			if (!isFirstCall) {
+				prefillMsExclFirst += ttftMs;
+				prefillTokensExclFirst += input;
+			}
+		}
+		if (spanMs !== undefined) {
+			decodeMs += spanMs;
+			decodeTokens += out;
+		}
+
 		if (roundOutputTokens > 0 || ppsValue !== undefined) renderFinal(ctx);
+	});
+
+	pi.registerCommand("pps-tgs", {
+		description: "Session speed totals: accumulated prefill/decode time and aggregate rates",
+		getArgumentCompletions: (prefix) =>
+			["reset"].filter((a) => a.startsWith(prefix)).map((value) => ({ value, label: value })),
+		handler: async (args, ctx) => {
+			if (args.trim() === "reset") {
+				resetSessionTotals();
+				ctx.ui.notify("Session speed totals reset.", "info");
+				return;
+			}
+			renderTotals(ctx);
+		},
 	});
 }
