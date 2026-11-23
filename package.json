@@ -1,7 +1,7 @@
 {
   "name": "pi-pps-tps-mini",
-  "version": "0.2.0",
-  "description": "Pi extension that shows prefill (pps) and generation (tgs) speed in the status bar",
+  "version": "0.3.0",
+  "description": "Pi extension that shows prefill (pps) and generation (tps) speed in the status bar",
   "keywords": ["pi-package"],
   "license": "MIT",
   "repository": {
